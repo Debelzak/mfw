@@ -1,0 +1,280 @@
+#!/bin/bash
+set -e
+
+### CHECK ROOT ###
+if [[ "$EUID" -ne 0 ]]; then
+  echo "Execute as root (sudo)"
+  exit 1
+fi
+
+### PATHS ###
+STATE_DIR="/etc/mfw"
+STATE_FILE="$STATE_DIR/rules.conf"
+CONFIG_FILE="$STATE_DIR/config.conf"
+
+### ARGUMENTS ###
+cmd="$1"
+proto="$2"
+port="$3"
+
+### HELP ###
+help() {
+  local cmd="$1"
+
+  case "$cmd" in
+    add)        help_add ;;
+    del)        help_del ;;
+    status)     help_status ;;
+    reload)     help_reload ;;
+    configure)  help_configure ;;
+    ""|help|*)  help_main ;;
+  esac
+
+  exit 1
+}
+
+help_main() {
+  cat <<EOF
+Usage:
+  mfw <command> [options]
+
+Available Commands:
+  add        Adds a TCP or UDP port forwarding rule
+  del        Removes an existing forwarding rule
+  status     Lists all configured forwarding rules
+  reload     Reloads and reapplies all firewall rules
+  configure  Starts the interactive configuration wizard
+EOF
+}
+
+help_add() {
+  cat <<EOF
+Usage:
+  mfw add <tcp|udp> <port>
+
+Adds a TCP or UDP port forwarding rule.
+
+Example:
+  mfw add tcp 25565
+EOF
+}
+
+help_del() {
+  cat <<EOF
+Usage:
+  mfw del <tcp|udp> <port>
+
+Removes an existing forwarding rule.
+
+Example:
+  mfw del udp 16261
+EOF
+}
+
+help_status() {
+  cat <<EOF
+Usage:
+  mfw status
+
+Lists all configured forwarding rules.
+EOF
+}
+
+help_reload() {
+  cat <<EOF
+Usage:
+  mfw reload
+
+Reloads and reapplies all firewall rules.
+EOF
+}
+
+help_configure() {
+  cat <<EOF
+Usage:
+  mfw configure
+
+Starts the interactive configuration wizard.
+EOF
+}
+
+### BOOTSTRAP ###
+mkdir -p "$STATE_DIR"
+touch "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+### CONFIG LOAD ###
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+}
+
+### DERIVE NETWORK BASED ON CIDR ###
+derive_network() {
+  DEST_HOST_IP="${DEST_IP%%/*}"
+  CIDR_MASK="${DEST_IP##*/}"
+
+  IFS=. read -r i1 i2 i3 i4 <<< "$DEST_HOST_IP"
+
+  IP=$(( (i1<<24) | (i2<<16) | (i3<<8) | i4 ))
+  MASK=$(( (0xFFFFFFFF << (32 - CIDR_MASK)) & 0xFFFFFFFF ))
+  NET=$(( IP & MASK ))
+
+  NET_IP=$(printf "%d.%d.%d.%d" \
+    $(( (NET >> 24) & 255 )) \
+    $(( (NET >> 16) & 255 )) \
+    $(( (NET >> 8) & 255 )) \
+    $(( NET & 255 ))
+  )
+
+  DEST_NET="$NET_IP/$CIDR_MASK"
+}
+
+
+### VALIDACAO ###
+require_config() {
+  [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]] && {
+    echo "✖ Incomplete configuration."
+    echo "Execute: mfw configure"
+    exit 1
+  }
+
+  derive_network
+}
+
+### PRE-CHECK ###
+if [[ "$cmd" != "configure" ]]; then
+  load_config || true
+  require_config
+fi
+
+### IPTABLES ###
+ensure_chains() {
+  iptables -t nat -N MFW_PREROUTING 2>/dev/null || true
+  iptables -N MFW_FORWARD 2>/dev/null || true
+
+  iptables -t nat -C PREROUTING -j MFW_PREROUTING 2>/dev/null || \
+    iptables -t nat -A PREROUTING -j MFW_PREROUTING
+
+  iptables -C FORWARD -j MFW_FORWARD 2>/dev/null || \
+    iptables -A FORWARD -j MFW_FORWARD
+}
+
+apply_rules() {
+  require_config
+  ensure_chains
+
+  # clear what is ours
+  iptables -t nat -F MFW_PREROUTING
+  iptables -F MFW_FORWARD
+
+  # SNAT to traffic comming from interal network
+  iptables -t nat -C POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE
+
+  while read -r p pt; do
+    [[ -z "$p" || "$p" =~ ^# ]] && continue
+
+    # DNAT
+    iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" --dport "$pt" \
+      -j DNAT --to-destination "$DEST_HOST_IP:$pt"
+
+    # In FORWARD
+    iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
+      -d "$DEST_HOST_IP" --dport "$pt" \
+      -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+
+    # return FORWARD
+    iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
+      -s "$DEST_HOST_IP" --sport "$pt" \
+      -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  done < "$STATE_FILE"
+}
+
+### COMMANDS ###
+configure() {
+  load_config || true
+
+  echo "== MFW Configuration =="
+  echo
+
+  read -rp "Public interface (PUBLIC_IF) [$PUBLIC_IF]: " input
+  PUBLIC_IF="${input:-$PUBLIC_IF}"
+
+  read -rp "Destination interface (DEST_IF) [$DEST_IF]: " input
+  DEST_IF="${input:-$DEST_IF}"
+
+  read -rp "Destination IP (CIDR, ex: 100.64.0.2/24) [$DEST_IP]: " input
+  DEST_IP="${input:-$DEST_IP}"
+
+  if ! [[ "$DEST_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+    echo "✖ Invalid CIDR format: $DEST_IP"
+    exit 1
+  fi
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+  sysctl -w net.ipv4.conf."$PUBLIC_IF".rp_filter=0 >/dev/null
+
+  cat > "$CONFIG_FILE" <<EOF
+# mfw configuration
+PUBLIC_IF="$PUBLIC_IF"
+DEST_IF="$DEST_IF"
+DEST_IP="$DEST_IP"
+EOF
+
+  chmod 600 "$CONFIG_FILE"
+
+  echo
+  echo "✔ Configuration saved at $CONFIG_FILE"
+  echo "↪ Applying rules..."
+  apply_rules
+}
+
+case "$cmd" in
+  add)
+    [[ -z "$proto" || -z "$port" ]] && help add
+    grep -q "^$proto $port$" "$STATE_FILE" && {
+      echo "⚠️  $port/$proto already exists"
+      exit 0
+    }
+    echo "$proto $port" >> "$STATE_FILE"
+    apply_rules
+    echo "✔ Added: $port/$proto"
+    ;;
+
+  del)
+    [[ -z "$proto" || -z "$port" ]] && help del
+
+    if ! grep -q "^$proto $port$" "$STATE_FILE"; then
+      echo "⚠️  $port/$proto does not exist."
+      exit 1
+    fi
+
+    sed -i "/^$proto $port$/d" "$STATE_FILE"
+    apply_rules
+    echo "✔ Removed: $port/$proto"
+    ;;
+
+  status)
+    if [[ ! -s "$STATE_FILE" ]]; then
+      echo "(no rules configured)"
+      exit 0
+    fi
+    echo "PROTO  PORT"
+    echo "------------"
+    column -t "$STATE_FILE"
+    ;;
+
+  reload)
+    apply_rules
+    echo "✔ Reloaded all rules"
+    ;;
+
+  configure)
+    configure
+    ;;
+
+  *)
+    help
+    ;;
+esac
