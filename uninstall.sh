@@ -66,7 +66,7 @@ fi
 ### REMOVE BINARY ###
 if [[ -f "$BIN" ]]; then
   echo "[5/7] Removing binary"
-  /bin/rm -rf "$STATE_DIR"
+  /bin/rm -f "$BIN"
 else
   echo "[5/7] Binary not found, skipping"
 fi
