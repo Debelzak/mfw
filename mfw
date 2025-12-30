@@ -52,10 +52,12 @@ help_add() {
 Usage:
   mfw add <tcp|udp> <port>
 
-Adds a TCP or UDP port forwarding rule.
+Adds a TCP or UDP port forwarding rule. You may specify a single port
+or a port range using the format "start-end" (example: 12621-12631).
 
-Example:
+Examples:
   mfw add tcp 25565
+  mfw add udp 12621-12631
 EOF
 }
 
@@ -64,10 +66,12 @@ help_del() {
 Usage:
   mfw del <tcp|udp> <port>
 
-Removes an existing forwarding rule.
+Removes an existing forwarding rule. If the rule was added as a range,
+pass the same range to remove it (exact match required).
 
-Example:
+Examples:
   mfw del udp 16261
+  mfw del tcp 12621-12631
 EOF
 }
 
@@ -141,6 +145,20 @@ require_config() {
   derive_network
 }
 
+# Validate a single port or a port range (start-end). Returns 0 if valid.
+is_valid_port_or_range() {
+  local v="$1"
+  if [[ "$v" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+    local a=${BASH_REMATCH[1]}
+    local b=${BASH_REMATCH[2]}
+    (( a >= 1 && a <= 65535 && b >= 1 && b <= 65535 && a <= b )) && return 0 || return 1
+  elif [[ "$v" =~ ^([0-9]{1,5})$ ]]; then
+    local p=${BASH_REMATCH[1]}
+    (( p >= 1 && p <= 65535 )) && return 0 || return 1
+  fi
+  return 1
+}
+
 ### PRE-CHECK ###
 if [[ "$cmd" != "configure" ]]; then
   load_config || true
@@ -173,20 +191,35 @@ apply_rules() {
 
   while read -r p pt; do
     [[ -z "$p" || "$p" =~ ^# ]] && continue
+    # If pt is a range, expand it; otherwise treat as single port
+    if [[ "$pt" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+      start_port=${BASH_REMATCH[1]}
+      end_port=${BASH_REMATCH[2]}
+      for ((cur_port=start_port; cur_port<=end_port; cur_port++)); do
+        iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" --dport "$cur_port" \
+          -j DNAT --to-destination "$DEST_HOST_IP:$cur_port"
 
-    # DNAT
-    iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" --dport "$pt" \
-      -j DNAT --to-destination "$DEST_HOST_IP:$pt"
+        iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
+          -d "$DEST_HOST_IP" --dport "$cur_port" \
+          -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
-    # In FORWARD
-    iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-      -d "$DEST_HOST_IP" --dport "$pt" \
-      -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+        iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
+          -s "$DEST_HOST_IP" --sport "$cur_port" \
+          -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      done
+    else
+      cur_port="$pt"
+      iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" --dport "$cur_port" \
+        -j DNAT --to-destination "$DEST_HOST_IP:$cur_port"
 
-    # return FORWARD
-    iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-      -s "$DEST_HOST_IP" --sport "$pt" \
-      -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
+        -d "$DEST_HOST_IP" --dport "$cur_port" \
+        -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+
+      iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
+        -s "$DEST_HOST_IP" --sport "$cur_port" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
   done < "$STATE_FILE"
 }
 
@@ -232,10 +265,14 @@ EOF
 case "$cmd" in
   add)
     [[ -z "$proto" || -z "$port" ]] && help add
-    grep -q "^$proto $port$" "$STATE_FILE" && {
+    if ! is_valid_port_or_range "$port"; then
+      echo "✖ Invalid port or range: $port"
+      exit 1
+    fi
+    if grep -q "^$proto $port$" "$STATE_FILE"; then
       echo "⚠️  $port/$proto already exists"
       exit 0
-    }
+    fi
     echo "$proto $port" >> "$STATE_FILE"
     apply_rules
     echo "✔ Added: $port/$proto"
@@ -243,6 +280,10 @@ case "$cmd" in
 
   del)
     [[ -z "$proto" || -z "$port" ]] && help del
+    if ! is_valid_port_or_range "$port"; then
+      echo "✖ Invalid port or range: $port"
+      exit 1
+    fi
 
     if ! grep -q "^$proto $port$" "$STATE_FILE"; then
       echo "⚠️  $port/$proto does not exist."

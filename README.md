@@ -83,10 +83,22 @@ sudo mfw add tcp 25565
 sudo mfw add udp 16261
 ```
 
+Você também pode adicionar um intervalo de portas no formato `start-end`.
+
+```bash
+sudo mfw add tcp 12621-12631   # adiciona todas as portas entre 12621 e 12631
+```
+
 ### ➖ Remover uma porta
 
 ```bash
 sudo mfw del udp 16261
+```
+
+Para remover um intervalo, passe o mesmo token usado na adição (remoção exige correspondência exata):
+
+```bash
+sudo mfw del tcp 12621-12631
 ```
 
 ### 📋 Verificar configuração/estado atual
