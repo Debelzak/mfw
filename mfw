@@ -2,7 +2,7 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.2.0"
+MFW_VERSION="1.2.1"
 
 ### CHECK ROOT ###
 if [[ "$EUID" -ne 0 ]]; then
@@ -51,18 +51,17 @@ help() {
 
 help_main() {
   cat <<EOF
-MFW v$MFW_VERSION - Minimal Forward Wrapper
-
 Usage:
   mfw <command> [options]
 
 Available Commands:
-  add        Adds a TCP or UDP port forwarding rule
-  del        Removes an existing forwarding rule
-  status     Lists all configured forwarding rules and current config
-  reload     Reloads and reapplies all firewall rules
-  configure  Starts the interactive configuration wizard
-  update     Checks for a newer version and updates if available
+  version        Prints the current version
+  add            Adds a TCP or UDP port forwarding rule
+  delete         Removes an existing forwarding rule
+  status         Lists all configured forwarding rules and current config
+  reload         Reloads and reapplies all firewall rules
+  configure      Starts the interactive configuration wizard
+  update         Checks for a newer version and updates if available
 EOF
 }
 
@@ -70,6 +69,9 @@ help_add() {
   cat <<EOF
 Usage:
   mfw add <tcp|udp> <port>
+
+Aliases:
+  add, a
 
 Adds a TCP or UDP port forwarding rule. You may specify a single port
 or a port range using the format "start-end" (example: 12621-12631).
@@ -85,6 +87,9 @@ help_del() {
 Usage:
   mfw del <tcp|udp> <port>
 
+Aliases:
+  delete, del, d
+
 Removes an existing forwarding rule. If the rule was added as a range,
 pass the same range to remove it (exact match required).
 
@@ -99,6 +104,9 @@ help_status() {
 Usage:
   mfw status
 
+Aliases:
+  status, s
+
 Lists all configured forwarding rules and active configuration.
 EOF
 }
@@ -108,6 +116,9 @@ help_reload() {
 Usage:
   mfw reload
 
+Aliases:
+  reload, r
+
 Reloads and reapplies all firewall rules.
 EOF
 }
@@ -116,6 +127,9 @@ help_configure() {
   cat <<EOF
 Usage:
   mfw configure
+
+Aliases:
+  configure, config
 
 Starts the interactive configuration wizard.
 EOF
@@ -195,7 +209,7 @@ is_valid_port_or_range() {
 }
 
 ### PRE-CHECK ###
-if [[ "$cmd" != "configure" && "$cmd" != "update" ]]; then
+if [[ "$cmd" != "configure" && "$cmd" != "update" && "$cmd" != "help" && "$cmd" != "h" && "$cmd" != "version" ]]; then
   load_config || true
   require_config
 fi
@@ -293,9 +307,6 @@ version_lt() {
 
 ### COMMANDS ###
 update() {
-  echo "== MFW v$MFW_VERSION — Update =="
-  echo
-
   if ! command -v curl >/dev/null 2>&1; then
     echo "✖ curl not found. Please install curl first."
     exit 1
@@ -352,9 +363,6 @@ update() {
 
 configure() {
   load_config || true
-
-  echo "== MFW v$MFW_VERSION — Configuration =="
-  echo
 
   read -rp "Public interface [$PUBLIC_IF]: " input
   PUBLIC_IF="${input:-$PUBLIC_IF}"
@@ -416,9 +424,6 @@ EOF
 status() {
   load_config || true
 
-  echo "== MFW v$MFW_VERSION — Status =="
-  echo
-
   # Config summary
   if [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]]; then
     echo "  Configuration  : ✖ not configured (run: mfw configure)"
@@ -451,6 +456,19 @@ status() {
 }
 
 case "$cmd" in
+  a) cmd=add ;;
+  d|delete) cmd=del ;;
+  v) cmd=version ;;
+  r) cmd=reload ;;
+  s) cmd=status ;;
+  config) cmd=configure ;;
+  h) cmd=help ;;
+ esac
+
+case "$cmd" in
+  help)
+    help "$2"
+    ;;
   add)
     [[ -z "$proto" || -z "$port" ]] && help add
 
@@ -508,6 +526,10 @@ case "$cmd" in
 
   update)
     update
+    ;;
+
+  version)
+    echo "$MFW_VERSION"
     ;;
 
   *)
