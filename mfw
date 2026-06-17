@@ -1,9 +1,18 @@
 #!/bin/bash
 set -e
 
+### VERSION ###
+MFW_VERSION="1.1.0"
+
 ### CHECK ROOT ###
 if [[ "$EUID" -ne 0 ]]; then
   echo "Execute as root (sudo)"
+  exit 1
+fi
+
+### CHECK DEPENDENCIES ###
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "✖ iptables not found. Please install iptables first."
   exit 1
 fi
 
@@ -11,6 +20,7 @@ fi
 STATE_DIR="/etc/mfw"
 STATE_FILE="$STATE_DIR/rules.conf"
 CONFIG_FILE="$STATE_DIR/config.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-mfw.conf"
 
 ### ARGUMENTS ###
 cmd="$1"
@@ -35,13 +45,15 @@ help() {
 
 help_main() {
   cat <<EOF
+MFW v$MFW_VERSION - Minimal Forward Wrapper
+
 Usage:
   mfw <command> [options]
 
 Available Commands:
   add        Adds a TCP or UDP port forwarding rule
   del        Removes an existing forwarding rule
-  status     Lists all configured forwarding rules
+  status     Lists all configured forwarding rules and current config
   reload     Reloads and reapplies all firewall rules
   configure  Starts the interactive configuration wizard
 EOF
@@ -80,7 +92,7 @@ help_status() {
 Usage:
   mfw status
 
-Lists all configured forwarding rules.
+Lists all configured forwarding rules and active configuration.
 EOF
 }
 
@@ -109,6 +121,7 @@ chmod 600 "$STATE_FILE"
 
 ### CONFIG LOAD ###
 load_config() {
+  # shellcheck source=/dev/null
   [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 }
 
@@ -133,16 +146,20 @@ derive_network() {
   DEST_NET="$NET_IP/$CIDR_MASK"
 }
 
-
-### VALIDACAO ###
+### VALIDATION ###
 require_config() {
   [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]] && {
     echo "✖ Incomplete configuration."
-    echo "Execute: mfw configure"
+    echo "  Run: mfw configure"
     exit 1
   }
 
   derive_network
+}
+
+# Validate protocol: must be tcp or udp
+is_valid_proto() {
+  [[ "$1" =~ ^(tcp|udp)$ ]]
 }
 
 # Validate a single port or a port range (start-end). Returns 0 if valid.
@@ -181,43 +198,56 @@ apply_rules() {
   require_config
   ensure_chains
 
-  # clear what is ours
+  # Clear what is ours
   iptables -t nat -F MFW_PREROUTING
   iptables -F MFW_FORWARD
 
-  # SNAT to traffic comming from interal network
+  # MASQUERADE for traffic coming from internal network
   iptables -t nat -C POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE 2>/dev/null || \
   iptables -t nat -A POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE
 
   while read -r p pt; do
+    # Skip empty lines and comments
     [[ -z "$p" || "$p" =~ ^# ]] && continue
-    # If pt is a range, expand it; otherwise treat as single port
+
+    # Sanitize: skip malformed entries
+    if ! is_valid_proto "$p"; then
+      echo "⚠️  Skipping invalid proto in rules file: '$p $pt'"
+      continue
+    fi
+    if ! is_valid_port_or_range "$pt"; then
+      echo "⚠️  Skipping invalid port in rules file: '$p $pt'"
+      continue
+    fi
+
     if [[ "$pt" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
-      start_port=${BASH_REMATCH[1]}
-      end_port=${BASH_REMATCH[2]}
-      for ((cur_port=start_port; cur_port<=end_port; cur_port++)); do
-        iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" --dport "$cur_port" \
-          -j DNAT --to-destination "$DEST_HOST_IP:$cur_port"
+      # Range: use native iptables range notation — no per-port loop needed
+      local start_port=${BASH_REMATCH[1]}
+      local end_port=${BASH_REMATCH[2]}
 
-        iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-          -d "$DEST_HOST_IP" --dport "$cur_port" \
-          -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
-
-        iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-          -s "$DEST_HOST_IP" --sport "$cur_port" \
-          -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-      done
-    else
-      cur_port="$pt"
-      iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" --dport "$cur_port" \
-        -j DNAT --to-destination "$DEST_HOST_IP:$cur_port"
+      iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" \
+        --dport "$start_port:$end_port" \
+        -j DNAT --to-destination "$DEST_HOST_IP:$start_port-$end_port"
 
       iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-        -d "$DEST_HOST_IP" --dport "$cur_port" \
+        -d "$DEST_HOST_IP" --dport "$start_port:$end_port" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
       iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-        -s "$DEST_HOST_IP" --sport "$cur_port" \
+        -s "$DEST_HOST_IP" --sport "$start_port:$end_port" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    else
+      # Single port
+      iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" \
+        --dport "$pt" \
+        -j DNAT --to-destination "$DEST_HOST_IP:$pt"
+
+      iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
+        -d "$DEST_HOST_IP" --dport "$pt" \
+        -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+
+      iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
+        -s "$DEST_HOST_IP" --sport "$pt" \
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     fi
   done < "$STATE_FILE"
@@ -227,7 +257,7 @@ apply_rules() {
 configure() {
   load_config || true
 
-  echo "== MFW Configuration =="
+  echo "== MFW v$MFW_VERSION — Configuration =="
   echo
 
   read -rp "Public interface [$PUBLIC_IF]: " input
@@ -238,41 +268,109 @@ configure() {
 
   read -rp "Destination IP (CIDR, ex: 100.64.0.2/24) [$DEST_IP]: " input
   DEST_IP="${input:-$DEST_IP}"
+
   if ! [[ "$DEST_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
     echo "✖ Invalid CIDR format: $DEST_IP"
     exit 1
   fi
 
+  echo
+  echo "  Public interface  : $PUBLIC_IF"
+  echo "  Destination iface : $DEST_IF"
+  echo "  Destination IP    : $DEST_IP"
+  echo
+
+  read -rp "Confirm and apply? [Y/n]: " confirm
+  confirm="${confirm:-Y}"
+  if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
+    echo "↩ Aborted. No changes made."
+    exit 0
+  fi
+
+  # Apply sysctl immediately
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
   sysctl -w net.ipv4.conf."$PUBLIC_IF".rp_filter=0 >/dev/null
 
+  # Persist sysctl across reboots
+  cat > "$SYSCTL_FILE" <<EOF
+# MFW - Minimal Forward Wrapper
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.$PUBLIC_IF.rp_filter = 0
+EOF
+  chmod 644 "$SYSCTL_FILE"
+
+  # Save config
   cat > "$CONFIG_FILE" <<EOF
-# mfw configuration
+# mfw configuration — do not edit manually
 PUBLIC_IF="$PUBLIC_IF"
 DEST_IF="$DEST_IF"
 DEST_IP="$DEST_IP"
 EOF
-
   chmod 600 "$CONFIG_FILE"
 
-  echo
   echo "✔ Configuration saved"
+  echo "✔ sysctl persisted to $SYSCTL_FILE"
   echo "↪ Reloading rules..."
   apply_rules
+  echo "✔ Done"
+}
+
+status() {
+  load_config || true
+
+  echo "== MFW v$MFW_VERSION — Status =="
+  echo
+
+  # Config summary
+  if [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]]; then
+    echo "  Configuration  : ✖ not configured (run: mfw configure)"
+  else
+    echo "  Public iface   : $PUBLIC_IF"
+    echo "  Dest iface     : $DEST_IF"
+    echo "  Dest IP/CIDR   : $DEST_IP"
+
+    # Count active iptables rules in our chains
+    nat_count=$(iptables -t nat -L MFW_PREROUTING 2>/dev/null | grep -c DNAT || true)
+    fwd_count=$(iptables -L MFW_FORWARD 2>/dev/null | grep -c ACCEPT || true)
+    echo "  Active rules   : $nat_count DNAT, $fwd_count FORWARD"
+  fi
+
+  echo
+
+  # Rule table
+  if [[ ! -s "$STATE_FILE" ]]; then
+    echo "  (no forwarding rules configured)"
+  else
+    echo "  PROTO  PORT"
+    echo "  ---------------"
+    while read -r p pt; do
+      [[ -z "$p" || "$p" =~ ^# ]] && continue
+      printf "  %-6s %s\n" "$p" "$pt"
+    done < "$STATE_FILE"
+  fi
+
+  echo
 }
 
 case "$cmd" in
   add)
     [[ -z "$proto" || -z "$port" ]] && help add
+
+    if ! is_valid_proto "$proto"; then
+      echo "✖ Invalid protocol: '$proto'. Use tcp or udp."
+      exit 1
+    fi
     if ! is_valid_port_or_range "$port"; then
-      echo "✖ Invalid port or range: $port"
+      echo "✖ Invalid port or range: '$port'"
       exit 1
     fi
     if grep -q "^$proto $port$" "$STATE_FILE"; then
       echo "⚠️  $port/$proto already exists"
       exit 0
     fi
+
     echo "$proto $port" >> "$STATE_FILE"
     apply_rules
     echo "✔ Added: $port/$proto"
@@ -280,11 +378,15 @@ case "$cmd" in
 
   del)
     [[ -z "$proto" || -z "$port" ]] && help del
-    if ! is_valid_port_or_range "$port"; then
-      echo "✖ Invalid port or range: $port"
+
+    if ! is_valid_proto "$proto"; then
+      echo "✖ Invalid protocol: '$proto'. Use tcp or udp."
       exit 1
     fi
-
+    if ! is_valid_port_or_range "$port"; then
+      echo "✖ Invalid port or range: '$port'"
+      exit 1
+    fi
     if ! grep -q "^$proto $port$" "$STATE_FILE"; then
       echo "⚠️  $port/$proto does not exist."
       exit 1
@@ -296,13 +398,7 @@ case "$cmd" in
     ;;
 
   status)
-    if [[ ! -s "$STATE_FILE" ]]; then
-      echo "(no rules configured)"
-      exit 0
-    fi
-    echo "PROTO  PORT"
-    echo "------------"
-    column -t "$STATE_FILE"
+    status
     ;;
 
   reload)
