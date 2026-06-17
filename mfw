@@ -2,7 +2,7 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.1.0"
+MFW_VERSION="1.2.0"
 
 ### CHECK ROOT ###
 if [[ "$EUID" -ne 0 ]]; then
@@ -17,10 +17,15 @@ if ! command -v iptables >/dev/null 2>&1; then
 fi
 
 ### PATHS ###
+BIN_DST="/usr/local/bin/mfw"
 STATE_DIR="/etc/mfw"
 STATE_FILE="$STATE_DIR/rules.conf"
 CONFIG_FILE="$STATE_DIR/config.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-mfw.conf"
+
+### GITHUB ###
+GH_REPO="debelzak/mfw"
+GH_RAW_URL="https://raw.githubusercontent.com/$GH_REPO/main/mfw"
 
 ### ARGUMENTS ###
 cmd="$1"
@@ -37,6 +42,7 @@ help() {
     status)     help_status ;;
     reload)     help_reload ;;
     configure)  help_configure ;;
+    update)     help_update ;;
     ""|help|*)  help_main ;;
   esac
 
@@ -56,6 +62,7 @@ Available Commands:
   status     Lists all configured forwarding rules and current config
   reload     Reloads and reapplies all firewall rules
   configure  Starts the interactive configuration wizard
+  update     Checks for a newer version and updates if available
 EOF
 }
 
@@ -111,6 +118,17 @@ Usage:
   mfw configure
 
 Starts the interactive configuration wizard.
+EOF
+}
+
+help_update() {
+  cat <<EOF
+Usage:
+  mfw update
+
+Checks GitHub for a newer release tag and, if one is found, downloads
+and replaces the current binary. The running configuration and rules
+are preserved.
 EOF
 }
 
@@ -177,7 +195,7 @@ is_valid_port_or_range() {
 }
 
 ### PRE-CHECK ###
-if [[ "$cmd" != "configure" ]]; then
+if [[ "$cmd" != "configure" && "$cmd" != "update" ]]; then
   load_config || true
   require_config
 fi
@@ -253,7 +271,85 @@ apply_rules() {
   done < "$STATE_FILE"
 }
 
+### VERSION COMPARISON ###
+# Compares two semver strings. Returns 0 if $1 < $2 (update available).
+version_lt() {
+  local a="$1" b="$2"
+  # Split into major.minor.patch arrays
+  IFS='.' read -r a1 a2 a3 <<< "$a"
+  IFS='.' read -r b1 b2 b3 <<< "$b"
+  # Default missing parts to 0
+  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
+  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
+
+  if   (( a1 < b1 )); then return 0
+  elif (( a1 > b1 )); then return 1
+  elif (( a2 < b2 )); then return 0
+  elif (( a2 > b2 )); then return 1
+  elif (( a3 < b3 )); then return 0
+  else return 1
+  fi
+}
+
 ### COMMANDS ###
+update() {
+  echo "== MFW v$MFW_VERSION — Update =="
+  echo
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "✖ curl not found. Please install curl first."
+    exit 1
+  fi
+
+  echo "↪ Fetching remote version from GitHub..."
+
+  # Download the remote script to a temp file
+  TMP_REMOTE="$(mktemp)"
+  trap '/bin/rm -f "$TMP_REMOTE"' EXIT
+
+  if ! curl -fsSL "$GH_RAW_URL" -o "$TMP_REMOTE" 2>/dev/null; then
+    echo "✖ Failed to reach GitHub. Check your internet connection."
+    exit 1
+  fi
+
+  if [[ ! -s "$TMP_REMOTE" ]]; then
+    echo "✖ Downloaded file is empty or invalid."
+    exit 1
+  fi
+
+  # Extract MFW_VERSION from the remote file
+  REMOTE_VERSION=$(grep -m1 '^MFW_VERSION=' "$TMP_REMOTE" | cut -d'"' -f2)
+
+  if [[ -z "$REMOTE_VERSION" ]]; then
+    echo "✖ Could not determine remote version. The file may be malformed."
+    exit 1
+  fi
+
+  echo "  Installed version : $MFW_VERSION"
+  echo "  Remote version    : $REMOTE_VERSION"
+  echo
+
+  if ! version_lt "$MFW_VERSION" "$REMOTE_VERSION"; then
+    echo "✔ Already up to date."
+    exit 0
+  fi
+
+  echo "  New version available: $MFW_VERSION → $REMOTE_VERSION"
+  echo
+  read -rp "Update now? [Y/n]: " confirm
+  confirm="${confirm:-Y}"
+  if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
+    echo "↩ Update cancelled."
+    exit 0
+  fi
+
+  # Atomic replace: install to final path
+  chmod +x "$TMP_REMOTE"
+  install -m 755 "$TMP_REMOTE" "$BIN_DST"
+
+  echo "✔ Updated to v$REMOTE_VERSION"
+}
+
 configure() {
   load_config || true
 
@@ -408,6 +504,10 @@ case "$cmd" in
 
   configure)
     configure
+    ;;
+
+  update)
+    update
     ;;
 
   *)
