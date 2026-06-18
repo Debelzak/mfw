@@ -2,19 +2,23 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.3.1"
+MFW_VERSION="1.3.2"
 
-### CHECK ROOT ###
-if [[ "$EUID" -ne 0 ]]; then
-  echo "error: you cannot perform this operation unless you are root"
-  exit 1
-fi
+### Privilege helpers ###
+require_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "error: you cannot perform this operation unless you are root"
+    exit 1
+  fi
+}
 
-### CHECK DEPENDENCIES ###
-if ! command -v iptables >/dev/null 2>&1; then
-  echo "✖ iptables not found. Please install iptables first."
-  exit 1
-fi
+### BOOTSTRAP (deferred until we need to write system paths) ###
+bootstrap() {
+  mkdir -p "$STATE_DIR"
+  chmod 755 "$STATE_DIR"
+  touch "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+}
 
 ### PATHS ###
 BIN_DST="/usr/local/bin/mfw"
@@ -22,6 +26,7 @@ STATE_DIR="/etc/mfw"
 STATE_FILE="$STATE_DIR/rules.conf"
 CONFIG_FILE="$STATE_DIR/config.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-mfw.conf"
+DEST_CIDR_BITS=24
 
 ### GITHUB ###
 GH_REPO="debelzak/mfw"
@@ -173,26 +178,20 @@ The running configuration and rules are always preserved.
 EOF
 }
 
-### BOOTSTRAP ###
-mkdir -p "$STATE_DIR"
-touch "$STATE_FILE"
-chmod 600 "$STATE_FILE"
+### Note: Bootstrap is called only for commands that require root. ###
 
 ### CONFIG LOAD ###
 load_config() {
   # shellcheck source=/dev/null
-  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+  [[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 }
 
 ### DERIVE NETWORK BASED ON CIDR ###
 derive_network() {
-  DEST_HOST_IP="${DEST_IP%%/*}"
-  CIDR_MASK="${DEST_IP##*/}"
-
-  IFS=. read -r i1 i2 i3 i4 <<< "$DEST_HOST_IP"
+  IFS=. read -r i1 i2 i3 i4 <<< "$DEST_IP"
 
   IP=$(( (i1<<24) | (i2<<16) | (i3<<8) | i4 ))
-  MASK=$(( (0xFFFFFFFF << (32 - CIDR_MASK)) & 0xFFFFFFFF ))
+  MASK=$(( (0xFFFFFFFF << (32 - DEST_CIDR_BITS)) & 0xFFFFFFFF ))
   NET=$(( IP & MASK ))
 
   NET_IP=$(printf "%d.%d.%d.%d" \
@@ -202,12 +201,12 @@ derive_network() {
     $(( NET & 255 ))
   )
 
-  DEST_NET="$NET_IP/$CIDR_MASK"
+  DEST_NET="$NET_IP/$DEST_CIDR_BITS"
 }
 
 ### VALIDATION ###
 require_config() {
-  [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]] && {
+  [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" || -z "$DEST_CIDR_BITS" ]] && {
     echo "✖ Incomplete configuration."
     echo "  Run: mfw configure"
     exit 1
@@ -236,13 +235,17 @@ is_valid_port_or_range() {
 }
 
 ### PRE-CHECK ###
-if [[ "$cmd" != "configure" && "$cmd" != "update" && "$cmd" != "help" && "$cmd" != "h" && "$cmd" != "version" ]]; then
+# Only auto-load config for `status` which may run unprivileged.
+if [[ "$cmd" == "status" ]]; then
   load_config || true
-  require_config
 fi
 
 ### IPTABLES ###
 ensure_chains() {
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "✖ iptables not found. Please install iptables first."
+    exit 1
+  fi
   iptables -t nat -N MFW_PREROUTING 2>/dev/null || true
   iptables -N MFW_FORWARD 2>/dev/null || true
 
@@ -286,27 +289,27 @@ apply_rules() {
 
       iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" \
         --dport "$start_port:$end_port" \
-        -j DNAT --to-destination "$DEST_HOST_IP:$start_port-$end_port"
+        -j DNAT --to-destination "$DEST_IP:$start_port-$end_port"
 
       iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-        -d "$DEST_HOST_IP" --dport "$start_port:$end_port" \
+        -d "$DEST_IP" --dport "$start_port:$end_port" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
       iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-        -s "$DEST_HOST_IP" --sport "$start_port:$end_port" \
+        -s "$DEST_IP" --sport "$start_port:$end_port" \
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     else
       # Single port
       iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" \
         --dport "$pt" \
-        -j DNAT --to-destination "$DEST_HOST_IP:$pt"
+        -j DNAT --to-destination "$DEST_IP:$pt"
 
       iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-        -d "$DEST_HOST_IP" --dport "$pt" \
+        -d "$DEST_IP" --dport "$pt" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
       iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-        -s "$DEST_HOST_IP" --sport "$pt" \
+        -s "$DEST_IP" --sport "$pt" \
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     fi
   done < "$STATE_FILE"
@@ -453,11 +456,19 @@ configure() {
   read -rp "Destination interface [$DEST_IF]: " input
   DEST_IF="${input:-$DEST_IF}"
 
-  read -rp "Destination IP (CIDR, ex: 100.64.0.2/24) [$DEST_IP]: " input
+  read -rp "Destination IP (ex: 100.64.0.2) [$DEST_IP]: " input
   DEST_IP="${input:-$DEST_IP}"
 
-  if ! [[ "$DEST_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-    echo "✖ Invalid CIDR format: $DEST_IP"
+  read -rp "Destination CIDR bits (ex: 24) [$DEST_CIDR_BITS]: " input
+  DEST_CIDR_BITS="${input:-$DEST_CIDR_BITS}"
+
+  if ! [[ "$DEST_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "✖ Invalid IP format: $DEST_IP"
+    exit 1
+  fi
+
+  if ! [[ "$DEST_CIDR_BITS" =~ ^[0-9]{1,2}$ ]] || (( DEST_CIDR_BITS > 32 )); then
+    echo "✖ Invalid CIDR bits: $DEST_CIDR_BITS (must be 0-32)"
     exit 1
   fi
 
@@ -494,8 +505,9 @@ EOF
 PUBLIC_IF="$PUBLIC_IF"
 DEST_IF="$DEST_IF"
 DEST_IP="$DEST_IP"
+DEST_CIDR_BITS="$DEST_CIDR_BITS"
 EOF
-  chmod 600 "$CONFIG_FILE"
+  chmod 644 "$CONFIG_FILE"
 
   echo "✔ Configuration saved"
   echo "✔ sysctl persisted to $SYSCTL_FILE"
@@ -553,6 +565,11 @@ case "$cmd" in
   add)
     [[ -z "$proto" || -z "$port" ]] && help add
 
+    require_root
+    bootstrap
+    load_config || true
+    require_config
+
     if ! is_valid_proto "$proto"; then
       echo "✖ Invalid protocol: '$proto'. Use tcp or udp."
       exit 1
@@ -573,6 +590,11 @@ case "$cmd" in
 
   del)
     [[ -z "$proto" || -z "$port" ]] && help del
+
+    require_root
+    bootstrap
+    load_config || true
+    require_config
 
     if ! is_valid_proto "$proto"; then
       echo "✖ Invalid protocol: '$proto'. Use tcp or udp."
@@ -597,15 +619,22 @@ case "$cmd" in
     ;;
 
   reload)
+    require_root
+    bootstrap
+    load_config || true
+    require_config
     apply_rules
     echo "✔ Reloaded all rules"
     ;;
 
   configure)
+    require_root
+    bootstrap
     configure
     ;;
 
   update)
+    require_root
     update
     ;;
 
