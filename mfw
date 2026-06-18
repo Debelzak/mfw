@@ -2,7 +2,7 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.2.3"
+MFW_VERSION="1.3.0"
 
 ### CHECK ROOT ###
 if [[ "$EUID" -ne 0 ]]; then
@@ -26,6 +26,26 @@ SYSCTL_FILE="/etc/sysctl.d/99-mfw.conf"
 ### GITHUB ###
 GH_REPO="debelzak/mfw"
 GH_RAW_URL="https://raw.githubusercontent.com/$GH_REPO/main/mfw"
+GH_SIG_URL="${GH_RAW_URL}.sig"
+
+### SIGNING KEY ###
+# This public key is embedded here intentionally.
+# It is used to verify the integrity and authenticity of updates before
+# any downloaded code is executed. The private key never leaves the
+# maintainer's machine. To verify this key independently:
+#   gpg --keyserver keys.openpgp.org --recv-keys <FINGERPRINT>
+#
+# Replace the fingerprint and key block below with your own before publishing.
+MFW_SIGNING_FINGERPRINT="C8FC9F1B3A1973144BDD99E3FE18E4D17EF64E7E"
+MFW_SIGNING_KEY='-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEajP9tRYJKwYBBAHaRw8BAQdAtetscxL+/E2xBeIxvHmK8ud1o6FxABE7W9Hy
+wLdScHi0H21mdyByZWxlYXNlcyA8bWFydUBtZGViLmNvbS5icj6IkAQTFgoAOBYh
+BMj8nxs6GXMUS92Z4/4Y5NF+9k5+BQJqM/21AhsjBQsJCAcCBhUKCQgLAgQWAgMB
+Ah4BAheAAAoJEP4Y5NF+9k5+t4ABAJDGpMVNJZKEkMGwpAV/D3rkp/rQVyzfiEpE
+Rkb+DInlAQDJy54751GFgvBtC+aFYM696y4Tqm1B+QMVItGYOT/SAA==
+=T9Mg
+-----END PGP PUBLIC KEY BLOCK-----'
 
 ### ARGUMENTS ###
 cmd="$1"
@@ -140,9 +160,16 @@ help_update() {
 Usage:
   mfw update
 
-Checks GitHub for a newer release tag and, if one is found, downloads
-and replaces the current binary. The running configuration and rules
-are preserved.
+Checks GitHub for a newer release and, if one is found, downloads it,
+verifies its GPG signature against the key embedded in this binary, and
+only then replaces the current installation.
+
+The update is aborted if:
+  - the signature file is missing or invalid
+  - the signature does not match the downloaded file
+  - the signing key fingerprint does not match the expected value
+
+The running configuration and rules are always preserved.
 EOF
 }
 
@@ -307,30 +334,76 @@ version_lt() {
 
 ### COMMANDS ###
 update() {
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "✖ curl not found. Please install curl first."
-    exit 1
-  fi
+  for dep in curl gpg; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      echo "✖ $dep not found. Please install $dep first."
+      exit 1
+    fi
+  done
 
-  echo "↪ Fetching remote version from GitHub..."
+  echo "↪ Fetching latest release from GitHub..."
 
-  # Download the remote script to a temp file
   TMP_REMOTE="$(mktemp)"
-  trap '/bin/rm -f "$TMP_REMOTE"' EXIT
+  TMP_SIG="$(mktemp)"
+  TMP_GNUPGHOME="$(mktemp -d)"
+  trap 'rm -rf "$TMP_GNUPGHOME"; rm -f "$TMP_REMOTE" "$TMP_SIG"' EXIT
 
   if ! curl -fsSL "$GH_RAW_URL" -o "$TMP_REMOTE" 2>/dev/null; then
     echo "✖ Failed to reach GitHub. Check your internet connection."
     exit 1
   fi
+  [[ ! -s "$TMP_REMOTE" ]] && { echo "✖ Downloaded file is empty or invalid."; exit 1; }
 
-  if [[ ! -s "$TMP_REMOTE" ]]; then
-    echo "✖ Downloaded file is empty or invalid."
+  if ! curl -fsSL "$GH_SIG_URL" -o "$TMP_SIG" 2>/dev/null; then
+    echo "✖ Failed to download the release signature (.sig)."
+    echo "  The release may not have been signed yet. Aborting."
+    exit 1
+  fi
+  [[ ! -s "$TMP_SIG" ]] && { echo "✖ Signature file is empty or invalid."; exit 1; }
+
+  # --- GPG verification in an isolated, ephemeral keyring ---
+  echo "↪ Verifying GPG signature..."
+
+  chmod 700 "$TMP_GNUPGHOME"
+
+  # Import only the key embedded in this binary — no external keyserver calls
+  if ! GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
+      --import <<< "$MFW_SIGNING_KEY" 2>/dev/null; then
+    echo "✖ Failed to import the embedded signing key."
     exit 1
   fi
 
-  # Extract MFW_VERSION from the remote file
-  REMOTE_VERSION=$(grep -m1 '^MFW_VERSION=' "$TMP_REMOTE" | cut -d'"' -f2)
+  # Verify the fingerprint of the imported key matches what this binary expects.
+  # This prevents a tampered script (with a replaced key + matching signature)
+  # from passing verification when the installed binary is still trustworthy.
+  IMPORTED_FP=$(GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
+    --with-colons --fingerprint 2>/dev/null \
+    | awk -F: '/^fpr/ { print $10; exit }')
 
+  if [[ "$IMPORTED_FP" != "$MFW_SIGNING_FINGERPRINT" ]]; then
+    echo "✖ Signing key fingerprint mismatch!"
+    echo "  Expected : $MFW_SIGNING_FINGERPRINT"
+    echo "  Got      : $IMPORTED_FP"
+    echo "  This binary may have been tampered with."
+    exit 1
+  fi
+
+  # Verify the detached signature against the downloaded file.
+  # --trust-model direct: trust any key explicitly present in this keyring,
+  # bypassing the web-of-trust (appropriate since we control the keyring).
+  if ! GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
+      --trust-model direct \
+      --verify "$TMP_SIG" "$TMP_REMOTE" 2>/dev/null; then
+    echo "✖ Signature verification FAILED."
+    echo "  The downloaded file does not match the release signature."
+    echo "  It may be corrupted or tampered with. Aborting."
+    exit 1
+  fi
+
+  echo "✔ Signature verified (key: ${MFW_SIGNING_FINGERPRINT:0:16}...)"
+
+  # --- Version check (after verification, not before) ---
+  REMOTE_VERSION=$(grep -m1 '^MFW_VERSION=' "$TMP_REMOTE" | cut -d'"' -f2)
   if [[ -z "$REMOTE_VERSION" ]]; then
     echo "✖ Could not determine remote version. The file may be malformed."
     exit 1
@@ -354,7 +427,7 @@ update() {
     exit 0
   fi
 
-  # Atomic replace: install to final path
+  # Atomic replace
   chmod +x "$TMP_REMOTE"
   install -m 755 "$TMP_REMOTE" "$BIN_DST"
 
