@@ -1,166 +1,156 @@
 # MFW — Minimal Forwarding Wrapper
 
-`mfw` é uma ferramenta simples e direta para **encaminhamento de portas TCP/UDP** usando `iptables`, pensada para cenários onde você possui **uma máquina com IP público** (cloud/VPS) e precisa expor serviços rodando em **outra máquina atrás de CGNAT**, VPN ou rede privada.
+`mfw` é um utilitário minimalista para **encaminhamento de portas TCP/UDP** usando `iptables`. Ele foi projetado para expor serviços em um destino privado a partir de um host público, especialmente quando a máquina de destino está atrás de **CGNAT**, **VPN** ou em uma **rede privada**.
 
-Ele foi criado para ser:
-- uma ferramenta simples
-- previsível
-- fácil de auditar
-- persistente
-- simples de manter
-- sem dependências externas
+## Por que usar o MFW
 
+- interface simples de linha de comando
+- regras persistentes em `/etc/mfw/rules.conf`
+- configuração e reload automáticos de regras
+- atualização segura com verificação GPG
+- proteção de gravação de configuração com `flock`
 
-## 🔎 Casos de uso comuns
+## Casos de uso comuns
 
-O `mfw` é útil principalmente quando:
+- expor servidores de jogo (Minecraft, Valheim, Project Zomboid)
+- redirecionar portas de serviços internos
+- conectar um host privado a um ponto de entrada público
+- publicar portas TCP/UDP sem depender apenas de proxies HTTP
 
-- Você tem um **VPS/Cloud/Máquina com IP público**
-- Sua máquina de destino está:
-  - atrás de **CGNAT**
-  - em **rede doméstica**
-  - conectada via **VPN**, túnel L3 ou link privado
-- Você quer expor **portas TCP/UDP deliberadas**, não se limitando apenas a HTTP/HTTPS, como um proxy reverso comum.
-
-### Exemplos práticos
-- Expor um servidor de jogo (Project Zomboid, Minecraft, Valheim, etc)
-- Redirecionar portas de serviços internos
-- Criar um “gateway” simples:
-
-(Seu IP público) → (Máquina pública) → MFW → `192.168.1.100`
-
-## 🧱 Arquitetura
-
-O `mfw` gerencia:
-- DNAT (PREROUTING)
-- FORWARD
-- SNAT (MASQUERADE)
-- Chains próprias (`MFW_PREROUTING`, `MFW_FORWARD`)
-
-Sem interferir com outras regras do sistema.
-
-## 📦 Requisitos
+## Requisitos
 
 - Linux
 - `bash`
 - `iptables` (legacy ou nft backend)
-- Kernel com `netfilter`
-- Acesso root
-- Um túnel funcional (ex: WireGuard) entre a máquina pública e a de destino
+- kernel com `netfilter`
+- acesso root
 
-## 🚀 Instalação
+### Requisitos opcionais para atualização
+
+- `curl`
+- `gpg`
+
+## Instalação
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Debelzak/mfw/main/install.sh)"
 ```
 
-## ⚙️ Configuração
+O instalador:
 
-Após a instalação o serviço iniciará o guia de configuração automaticamente, após isso, se quiser modificar alguma configuração/refazer a configuração. Utilize:
+1. cria `/etc/mfw`
+2. instala o binário em `/usr/local/bin/mfw`
+3. cria `mfw.service` no systemd
+4. executa o assistente de configuração interativa
+5. habilita e inicia o serviço
+
+## Configuração
+
+Use:
 
 ```bash
 sudo mfw configure
 ```
 
-Você será guiado para definir:
+O assistente pergunta por:
 
-* Interface pública (ex: `enp4s0`, `eth0`)
-* Interface do túnel (ex: `wg0`, `tun0`)
-* IP de destino (CIDR) (ex: `100.64.0.2/24`, `10.100.0.2/24`)
+- interface pública (ex: `enp4s0`, `eth0`)
+- interface de destino ou túnel (ex: `wg0`, `tun0`)
+- IP de destino (ex: `100.64.0.2`)
+- CIDR prefixo (ex: `24`)
 
-O script irá:
+O `mfw` salva a configuração em `/etc/mfw/config.conf` e aplica ajustes de sysctl para:
 
-* habilitar `ip_forward`
-* desabilitar `rp_filter` nas interfaces necessárias
-* salvar a configuração em `/etc/mfw/config.conf`
+- habilitar `net.ipv4.ip_forward`
+- desabilitar `net.ipv4.conf.all.rp_filter`
+- desabilitar `net.ipv4.conf.$PUBLIC_IF.rp_filter`
 
-## 🧪 Uso básico
+## Comandos
 
-### ➕ Adicionar uma porta
+- `mfw version` — mostra a versão instalada
+- `mfw add <tcp|udp> <port|start-end>` — adiciona regra de redirecionamento
+- `mfw del <tcp|udp> <port|start-end>` — remove regra existente
+- `mfw status` — exibe configuração e estado atual
+- `mfw reload` — reaplica todas as regras
+- `mfw configure` — reexecuta o assistente de configuração
+- `mfw update` — verifica release no GitHub e atualiza com assinatura GPG
+- `mfw help [command]` — mostra ajuda específica
+
+## Uso básico
+
+### Adicionar uma porta
 
 ```bash
 sudo mfw add tcp 25565
 sudo mfw add udp 16261
 ```
 
-Você também pode adicionar um intervalo de portas no formato `start-end`.
+### Adicionar um intervalo
 
 ```bash
-sudo mfw add tcp 12621-12631   # adiciona todas as portas entre 12621 e 12631
+sudo mfw add tcp 12621-12631
 ```
 
-### ➖ Remover uma porta
+### Remover uma porta
 
 ```bash
 sudo mfw del udp 16261
 ```
 
-Para remover um intervalo, passe o mesmo token usado na adição (remoção exige correspondência exata):
+### Remover um intervalo
 
 ```bash
 sudo mfw del tcp 12621-12631
 ```
 
-### 📋 Verificar configuração/estado atual
+### Verificar estado
 
 ```bash
 sudo mfw status
 ```
 
-Exemplo de saída:
-
-```
-PROTO  PORT
-tcp    25565
-udp    16261
-```
-
-### 🔄 Recarregar regras
+### Recarregar regras
 
 ```bash
 sudo mfw reload
 ```
 
-Útil após ajustes manuais ou para depuração.
-
-### ❓ Ajuda
+### Ajuda
 
 ```bash
 mfw help
 mfw help add
-mfw help del
+mfw help configure
 ```
 
-Ou:
-```bash
-mfw add --help
-```
+## Segurança
 
-## 🔐 Segurança
+O `mfw` não faz controle de acesso. Ele apenas expõe as portas configuradas.
 
-Por padrão:
+- qualquer IP pode acessar as portas expostas
+- filtragem adicional deve ser feita em firewall de borda ou no destino
 
-* Qualquer IP da internet pode acessar as portas expostas
-* O controle de acesso **não é feito pelo mfw**
-
-## 📁 Arquivos criados
+## Arquivos gerados
 
 ```text
 /etc/mfw/
-├── config.conf    # Configuração principal
-└── rules.conf     # Lista de portas gerenciadas
+├── config.conf    # configuração principal
+└── rules.conf     # lista de portas gerenciadas
 ```
 
-## 🗑️ Remoção
+Além disso, o instalador cria:
 
-Caso deseje remover o MFW do seu sistema, basta utilizar o comando abaixo.
+- `/etc/systemd/system/mfw.service`
+- `/etc/sysctl.d/99-mfw.conf`
+
+## Desinstalação
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Debelzak/mfw/main/uninstall.sh)"
 ```
 
-## 🧪 Testado em
+## Testado em
 
-* Debian/Ubuntu
-* Fedora
-* ArchLinux
+- Debian/Ubuntu
+- Fedora
+- Arch Linux
