@@ -2,7 +2,7 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.3.0"
+MFW_VERSION="1.3.1"
 
 ### CHECK ROOT ###
 if [[ "$EUID" -ne 0 ]]; then
@@ -25,8 +25,8 @@ SYSCTL_FILE="/etc/sysctl.d/99-mfw.conf"
 
 ### GITHUB ###
 GH_REPO="debelzak/mfw"
-GH_RAW_URL="https://raw.githubusercontent.com/$GH_REPO/main/mfw"
-GH_SIG_URL="${GH_RAW_URL}.sig"
+# Use GitHub Releases API to discover latest release and assets
+GH_API_URL="https://api.github.com/repos/$GH_REPO/releases/latest"
 
 ### SIGNING KEY ###
 # This public key is embedded here intentionally.
@@ -334,78 +334,41 @@ version_lt() {
 
 ### COMMANDS ###
 update() {
-  for dep in curl gpg; do
+  for dep in curl gpg perl; do
     if ! command -v "$dep" >/dev/null 2>&1; then
       echo "✖ $dep not found. Please install $dep first."
       exit 1
     fi
   done
 
-  echo "↪ Fetching latest release from GitHub..."
+  echo "↪ Fetching latest release metadata from GitHub..."
 
+  TMP_JSON="$(mktemp)"
   TMP_REMOTE="$(mktemp)"
   TMP_SIG="$(mktemp)"
   TMP_GNUPGHOME="$(mktemp -d)"
-  trap 'rm -rf "$TMP_GNUPGHOME"; rm -f "$TMP_REMOTE" "$TMP_SIG"' EXIT
+  trap 'rm -rf "$TMP_GNUPGHOME"; rm -f "$TMP_JSON" "$TMP_REMOTE" "$TMP_SIG"' EXIT
 
-  if ! curl -fsSL "$GH_RAW_URL" -o "$TMP_REMOTE" 2>/dev/null; then
+  if ! curl -fsSL -o "$TMP_JSON" "$GH_API_URL" 2>/dev/null; then
     echo "✖ Failed to reach GitHub. Check your internet connection."
     exit 1
   fi
-  [[ ! -s "$TMP_REMOTE" ]] && { echo "✖ Downloaded file is empty or invalid."; exit 1; }
+  [[ ! -s "$TMP_JSON" ]] && { echo "✖ Failed to fetch release metadata."; exit 1; }
 
-  if ! curl -fsSL "$GH_SIG_URL" -o "$TMP_SIG" 2>/dev/null; then
-    echo "✖ Failed to download the release signature (.sig)."
-    echo "  The release may not have been signed yet. Aborting."
-    exit 1
-  fi
-  [[ ! -s "$TMP_SIG" ]] && { echo "✖ Signature file is empty or invalid."; exit 1; }
-
-  # --- GPG verification in an isolated, ephemeral keyring ---
-  echo "↪ Verifying GPG signature..."
-
-  chmod 700 "$TMP_GNUPGHOME"
-
-  # Import only the key embedded in this binary — no external keyserver calls
-  if ! GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
-      --import <<< "$MFW_SIGNING_KEY" 2>/dev/null; then
-    echo "✖ Failed to import the embedded signing key."
-    exit 1
-  fi
-
-  # Verify the fingerprint of the imported key matches what this binary expects.
-  # This prevents a tampered script (with a replaced key + matching signature)
-  # from passing verification when the installed binary is still trustworthy.
-  IMPORTED_FP=$(GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
-    --with-colons --fingerprint 2>/dev/null \
-    | awk -F: '/^fpr/ { print $10; exit }')
-
-  if [[ "$IMPORTED_FP" != "$MFW_SIGNING_FINGERPRINT" ]]; then
-    echo "✖ Signing key fingerprint mismatch!"
-    echo "  Expected : $MFW_SIGNING_FINGERPRINT"
-    echo "  Got      : $IMPORTED_FP"
-    echo "  This binary may have been tampered with."
-    exit 1
-  fi
-
-  # Verify the detached signature against the downloaded file.
-  # --trust-model direct: trust any key explicitly present in this keyring,
-  # bypassing the web-of-trust (appropriate since we control the keyring).
-  if ! GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
-      --trust-model direct \
-      --verify "$TMP_SIG" "$TMP_REMOTE" 2>/dev/null; then
-    echo "✖ Signature verification FAILED."
-    echo "  The downloaded file does not match the release signature."
-    echo "  It may be corrupted or tampered with. Aborting."
-    exit 1
-  fi
-
-  echo "✔ Signature verified (key: ${MFW_SIGNING_FINGERPRINT:0:16}...)"
-
-  # --- Version check (after verification, not before) ---
-  REMOTE_VERSION=$(grep -m1 '^MFW_VERSION=' "$TMP_REMOTE" | cut -d'"' -f2)
+  # Parse remote tag and strip leading 'v' if present
+  REMOTE_TAG=$(perl -0777 -ne 'print $1 if /"tag_name"\s*:\s*"(v?[^\"]+)"/s' "$TMP_JSON" || true)
+  REMOTE_VERSION="${REMOTE_TAG#v}"
   if [[ -z "$REMOTE_VERSION" ]]; then
-    echo "✖ Could not determine remote version. The file may be malformed."
+    echo "✖ Could not determine remote version."
+    exit 1
+  fi
+
+  # Extract asset download URLs for 'mfw' and 'mfw.sig' without jq
+  MFW_URL=$(perl -0777 -ne 'print $1 if /"name"\s*:\s*"mfw".*?"browser_download_url"\s*:\s*"([^\"]+)"/s' "$TMP_JSON" || true)
+  SIG_URL=$(perl -0777 -ne 'print $1 if /"name"\s*:\s*"mfw.sig".*?"browser_download_url"\s*:\s*"([^\"]+)"/s' "$TMP_JSON" || true)
+
+  if [[ -z "$MFW_URL" || -z "$SIG_URL" ]]; then
+    echo "✖ Could not find release assets (mfw and mfw.sig) in latest release."
     exit 1
   fi
 
@@ -420,6 +383,54 @@ update() {
 
   echo "  New version available: $MFW_VERSION → $REMOTE_VERSION"
   echo
+
+  # Download assets (already validated via API parsing)
+  if ! curl -fsSL -o "$TMP_REMOTE" "$MFW_URL" 2>/dev/null; then
+    echo "✖ Failed to download asset: $MFW_URL"
+    exit 1
+  fi
+  [[ ! -s "$TMP_REMOTE" ]] && { echo "✖ Downloaded file is empty or invalid."; exit 1; }
+
+  if ! curl -fsSL -o "$TMP_SIG" "$SIG_URL" 2>/dev/null; then
+    echo "✖ Failed to download signature: $SIG_URL"
+    exit 1
+  fi
+  [[ ! -s "$TMP_SIG" ]] && { echo "✖ Signature file is empty or invalid."; exit 1; }
+
+  # --- GPG verification in an isolated, ephemeral keyring ---
+  echo "↪ Verifying GPG signature..."
+
+  chmod 700 "$TMP_GNUPGHOME"
+
+  if ! GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
+      --import <<< "$MFW_SIGNING_KEY" 2>/dev/null; then
+    echo "✖ Failed to import the embedded signing key."
+    exit 1
+  fi
+
+  IMPORTED_FP=$(GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
+    --with-colons --fingerprint 2>/dev/null \
+    | awk -F: '/^fpr/ { print $10; exit }')
+
+  if [[ "$IMPORTED_FP" != "$MFW_SIGNING_FINGERPRINT" ]]; then
+    echo "✖ Signing key fingerprint mismatch!"
+    echo "  Expected : $MFW_SIGNING_FINGERPRINT"
+    echo "  Got      : $IMPORTED_FP"
+    echo "  This binary may have been tampered with."
+    exit 1
+  fi
+
+  if ! GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --quiet \
+      --trust-model direct \
+      --verify "$TMP_SIG" "$TMP_REMOTE" 2>/dev/null; then
+    echo "✖ Signature verification FAILED."
+    echo "  The downloaded file does not match the release signature."
+    echo "  It may be corrupted or tampered with. Aborting."
+    exit 1
+  fi
+
+  echo "✔ Signature verified (key: ${MFW_SIGNING_FINGERPRINT:0:16}...)"
+
   read -rp "Update now? [Y/n]: " confirm
   confirm="${confirm:-Y}"
   if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
@@ -427,7 +438,6 @@ update() {
     exit 0
   fi
 
-  # Atomic replace
   chmod +x "$TMP_REMOTE"
   install -m 755 "$TMP_REMOTE" "$BIN_DST"
 
