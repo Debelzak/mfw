@@ -2,7 +2,7 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.2.2"
+MFW_VERSION="1.2.3"
 
 ### CHECK ROOT ###
 if [[ "$EUID" -ne 0 ]]; then
@@ -426,33 +426,31 @@ status() {
 
   # Config summary
   if [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]]; then
-    echo "  Configuration  : ✖ not configured (run: mfw configure)"
+    echo "Configuration  : ✖ not configured (run: mfw configure)"
   else
-    echo "  Public iface   : $PUBLIC_IF"
-    echo "  Dest iface     : $DEST_IF"
-    echo "  Dest IP/CIDR   : $DEST_IP"
+    echo "Input iface      : $PUBLIC_IF"
+    echo "Output iface     : $DEST_IF"
+    echo "Destination IP   : $DEST_IP"
 
     # Count active iptables rules in our chains
     nat_count=$(iptables -t nat -L MFW_PREROUTING 2>/dev/null | grep -c DNAT || true)
     fwd_count=$(iptables -L MFW_FORWARD 2>/dev/null | grep -c ACCEPT || true)
-    echo "  Active rules   : $nat_count DNAT, $fwd_count FORWARD"
+    echo "Active rules     : $nat_count DNAT, $fwd_count FORWARD"
   fi
 
-  echo
+  echo "---------------"
 
   # Rule table
   if [[ ! -s "$STATE_FILE" ]]; then
-    echo "  (no forwarding rules configured)"
+    echo "(no forwarding rules configured)"
   else
-    echo "  PROTO  PORT"
-    echo "  ---------------"
+    echo "PROTO  PORT"
+    echo "---------------"
     while read -r p pt; do
       [[ -z "$p" || "$p" =~ ^# ]] && continue
       printf "  %-6s %s\n" "$p" "$pt"
     done < "$STATE_FILE"
   fi
-
-  echo
 }
 
 case "$cmd" in
