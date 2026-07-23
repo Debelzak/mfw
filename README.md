@@ -56,8 +56,6 @@ O assistente pergunta por:
 
 - interface pública (ex: `enp4s0`, `eth0`)
 - interface de destino ou túnel (ex: `wg0`, `tun0`)
-- IP de destino (ex: `100.64.0.2`)
-- CIDR prefixo (ex: `24`)
 
 O `mfw` salva a configuração em `/etc/mfw/config.conf` e aplica ajustes de sysctl para:
 
@@ -68,8 +66,8 @@ O `mfw` salva a configuração em `/etc/mfw/config.conf` e aplica ajustes de sys
 ## Comandos
 
 - `mfw version` — mostra a versão instalada
-- `mfw add <tcp|udp> <port|start-end>` — adiciona regra de redirecionamento
-- `mfw del <tcp|udp> <port|start-end>` — remove regra existente
+- `mfw add <tcp|udp> <port|start-end> [dest_ip/cidr]` — adiciona regra de redirecionamento com destino por regra
+- `mfw del <tcp|udp> <port|start-end> [dest_ip/cidr]` — remove regra existente
 - `mfw status` — exibe configuração e estado atual
 - `mfw reload` — reaplica todas as regras
 - `mfw configure` — reexecuta o assistente de configuração
@@ -78,18 +76,22 @@ O `mfw` salva a configuração em `/etc/mfw/config.conf` e aplica ajustes de sys
 
 ## Uso básico
 
-### Adicionar uma porta
+### Adicionar uma porta com destino específico
 
 ```bash
-sudo mfw add tcp 25565
-sudo mfw add udp 16261
+sudo mfw add tcp 25565 10.226.10.2/24
+sudo mfw add udp 16261 10.226.10.3/24
 ```
 
 ### Adicionar um intervalo
 
 ```bash
-sudo mfw add tcp 12621-12631
+sudo mfw add tcp 12621-12631 10.226.10.4/24
 ```
+
+### Compatibilidade com regras antigas
+
+Se um cliente antigo ainda tiver `DEST_IP` e `DEST_CIDR_BITS` em `config.conf`, o novo `mfw` continua aceitando `mfw add tcp 25565` como fallback legado. O novo formato também migra automaticamente regras antigas para o formato com destino por regra apenas quando necessário.
 
 ### Remover uma porta
 

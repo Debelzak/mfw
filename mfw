@@ -2,7 +2,7 @@
 set -e
 
 ### VERSION ###
-MFW_VERSION="1.3.3"
+MFW_VERSION="2.0.0"
 
 ### Privilege helpers ###
 require_root() {
@@ -56,6 +56,7 @@ Rkb+DInlAQDJy54751GFgvBtC+aFYM696y4Tqm1B+QMVItGYOT/SAA==
 cmd="$1"
 proto="$2"
 port="$3"
+dest="$4"
 
 ### HELP ###
 help() {
@@ -93,7 +94,7 @@ EOF
 help_add() {
   cat <<EOF
 Usage:
-  mfw add <tcp|udp> <port>
+  mfw add <tcp|udp> <port> [dest_ip[/cidr]]
 
 Aliases:
   add, a
@@ -101,26 +102,35 @@ Aliases:
 Adds a TCP or UDP port forwarding rule. You may specify a single port
 or a port range using the format "start-end" (example: 12621-12631).
 
+The destination is stored per rule, so multiple destinations can coexist
+by using the format:
+  mfw add tcp 80 10.226.10.2/24
+
+Legacy behavior is still accepted when the destination is omitted and the
+previous global configuration still provides DEST_IP/DEST_CIDR_BITS.
+
 Examples:
-  mfw add tcp 25565
-  mfw add udp 12621-12631
+  mfw add tcp 25565 10.226.10.2/24
+  mfw add udp 12621-12631 10.226.10.3/24
 EOF
 }
 
 help_del() {
   cat <<EOF
 Usage:
-  mfw del <tcp|udp> <port>
+  mfw del <tcp|udp> <port> [dest_ip[/cidr]]
 
 Aliases:
   delete, del, d
 
 Removes an existing forwarding rule. If the rule was added as a range,
-pass the same range to remove it (exact match required).
+pass the same range to remove it (exact match required). When the
+(optional) destination is omitted, all matching rules for that protocol
+and port are removed, which keeps older workflows backward compatible.
 
 Examples:
   mfw del udp 16261
-  mfw del tcp 12621-12631
+  mfw del tcp 12621-12631 10.226.10.2/24
 EOF
 }
 
@@ -186,12 +196,93 @@ load_config() {
   [[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 }
 
+normalize_destination_spec() {
+  local dest_spec="$1"
+  local ip="${DEST_IP:-}"
+  local cidr_bits="${DEST_CIDR_BITS:-24}"
+
+  if [[ -n "$dest_spec" ]]; then
+    if [[ "$dest_spec" == */* ]]; then
+      ip="${dest_spec%/*}"
+      cidr_bits="${dest_spec##*/}"
+    else
+      ip="$dest_spec"
+    fi
+  fi
+
+  [[ -n "$ip" ]] || return 1
+
+  if ! is_valid_ipv4 "$ip"; then
+    echo "✖ Invalid destination IP: $ip"
+    return 1
+  fi
+
+  if ! is_valid_cidr_bits "$cidr_bits"; then
+    echo "✖ Invalid CIDR bits: $cidr_bits (must be 0-32)"
+    return 1
+  fi
+
+  printf '%s/%s' "$ip" "$cidr_bits"
+}
+
+resolve_rule_target() {
+  local dest_spec="$1"
+  local normalized
+
+  normalized="$(normalize_destination_spec "$dest_spec")" || return 1
+
+  DEST_TARGET_IP="${normalized%/*}"
+  DEST_TARGET_CIDR_BITS="${normalized##*/}"
+  derive_network "$DEST_TARGET_IP" "$DEST_TARGET_CIDR_BITS"
+}
+
+migrate_legacy_rules() {
+  [[ -r "$STATE_FILE" ]] || return 0
+  [[ -n "$DEST_IP" ]] || return 0
+
+  local tmp_file
+  tmp_file=$(mktemp)
+  local migrated=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$line" || "$line" =~ ^# ]]; then
+      printf '%s\n' "$line" >> "$tmp_file"
+      continue
+    fi
+
+    if [[ "$line" =~ ^([[:space:]]*)(tcp|udp)([[:space:]]+)([0-9]{1,5})([[:space:]]*)(.*)$ ]]; then
+      local proto_key="${BASH_REMATCH[2]}"
+      local port_key="${BASH_REMATCH[4]}"
+      local rest="${BASH_REMATCH[6]}"
+
+      if [[ -z "$rest" ]]; then
+        printf '%s %s %s/%s\n' "$proto_key" "$port_key" "$DEST_IP" "$DEST_CIDR_BITS" >> "$tmp_file"
+        migrated=1
+      else
+        printf '%s\n' "$line" >> "$tmp_file"
+      fi
+    else
+      printf '%s\n' "$line" >> "$tmp_file"
+    fi
+  done < "$STATE_FILE"
+
+  if (( migrated )); then
+    mv "$tmp_file" "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+  else
+    rm -f "$tmp_file"
+  fi
+}
+
 ### DERIVE NETWORK BASED ON CIDR ###
 derive_network() {
-  IFS=. read -r i1 i2 i3 i4 <<< "$DEST_IP"
+  local ip="${1:-$DEST_IP}"
+  local cidr_bits="${2:-${DEST_CIDR_BITS:-24}}"
+
+  IFS=. read -r i1 i2 i3 i4 <<< "$ip"
 
   IP=$(( (i1<<24) | (i2<<16) | (i3<<8) | i4 ))
-  MASK=$(( (0xFFFFFFFF << (32 - DEST_CIDR_BITS)) & 0xFFFFFFFF ))
+  MASK=$(( (0xFFFFFFFF << (32 - cidr_bits)) & 0xFFFFFFFF ))
   NET=$(( IP & MASK ))
 
   NET_IP=$(printf "%d.%d.%d.%d" \
@@ -201,28 +292,28 @@ derive_network() {
     $(( NET & 255 ))
   )
 
-  DEST_NET="$NET_IP/$DEST_CIDR_BITS"
+  DEST_NET="$NET_IP/$cidr_bits"
 }
 
 ### VALIDATION ###
 require_config() {
-  [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" || -z "$DEST_CIDR_BITS" ]] && {
+  [[ -z "$PUBLIC_IF" || -z "$DEST_IF" ]] && {
     echo "✖ Incomplete configuration."
     echo "  Run: mfw configure"
     exit 1
   }
 
-  if ! is_valid_ipv4 "$DEST_IP"; then
-    echo "✖ Invalid destination IP: $DEST_IP"
-    exit 1
-  fi
+  if [[ -n "$DEST_IP" ]]; then
+    if ! is_valid_ipv4 "$DEST_IP"; then
+      echo "✖ Invalid destination IP: $DEST_IP"
+      exit 1
+    fi
 
-  if ! is_valid_cidr_bits "$DEST_CIDR_BITS"; then
-    echo "✖ Invalid CIDR bits: $DEST_CIDR_BITS (must be 0-32)"
-    exit 1
+    if ! is_valid_cidr_bits "$DEST_CIDR_BITS"; then
+      echo "✖ Invalid CIDR bits: $DEST_CIDR_BITS (must be 0-32)"
+      exit 1
+    fi
   fi
-
-  derive_network
 }
 
 is_valid_ipv4() {
@@ -289,23 +380,36 @@ apply_rules() {
   iptables -t nat -F MFW_PREROUTING
   iptables -F MFW_FORWARD
 
-  # MASQUERADE for traffic coming from internal network
-  iptables -t nat -C POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE
-
-  while read -r p pt; do
+  while read -r p pt rule_target; do
     # Skip empty lines and comments
     [[ -z "$p" || "$p" =~ ^# ]] && continue
 
     # Sanitize: skip malformed entries
     if ! is_valid_proto "$p"; then
-      echo "⚠️  Skipping invalid proto in rules file: '$p $pt'"
+      echo "⚠️  Skipping invalid proto in rules file: '$p $pt $rule_target'"
       continue
     fi
     if ! is_valid_port_or_range "$pt"; then
-      echo "⚠️  Skipping invalid port in rules file: '$p $pt'"
+      echo "⚠️  Skipping invalid port in rules file: '$p $pt $rule_target'"
       continue
     fi
+
+    if [[ -n "$rule_target" ]]; then
+      if ! resolve_rule_target "$rule_target"; then
+        echo "⚠️  Skipping invalid destination in rules file: '$p $pt $rule_target'"
+        continue
+      fi
+    else
+      if [[ -z "$DEST_IP" ]]; then
+        echo "⚠️  Skipping rule without destination: '$p $pt'"
+        continue
+      fi
+      resolve_rule_target "$DEST_IP/$DEST_CIDR_BITS"
+    fi
+
+    # MASQUERADE for traffic coming from internal network
+    iptables -t nat -C POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "$DEST_NET" -o "$PUBLIC_IF" -j MASQUERADE
 
     if [[ "$pt" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
       # Range: use native iptables range notation — no per-port loop needed
@@ -314,27 +418,27 @@ apply_rules() {
 
       iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" \
         --dport "$start_port:$end_port" \
-        -j DNAT --to-destination "$DEST_IP:$start_port-$end_port"
+        -j DNAT --to-destination "$DEST_TARGET_IP:$start_port-$end_port"
 
       iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-        -d "$DEST_IP" --dport "$start_port:$end_port" \
+        -d "$DEST_TARGET_IP" --dport "$start_port:$end_port" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
       iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-        -s "$DEST_IP" --sport "$start_port:$end_port" \
+        -s "$DEST_TARGET_IP" --sport "$start_port:$end_port" \
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     else
       # Single port
       iptables -t nat -A MFW_PREROUTING -i "$PUBLIC_IF" -p "$p" \
         --dport "$pt" \
-        -j DNAT --to-destination "$DEST_IP:$pt"
+        -j DNAT --to-destination "$DEST_TARGET_IP:$pt"
 
       iptables -A MFW_FORWARD -i "$PUBLIC_IF" -o "$DEST_IF" -p "$p" \
-        -d "$DEST_IP" --dport "$pt" \
+        -d "$DEST_TARGET_IP" --dport "$pt" \
         -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
 
       iptables -A MFW_FORWARD -i "$DEST_IF" -o "$PUBLIC_IF" -p "$p" \
-        -s "$DEST_IP" --sport "$pt" \
+        -s "$DEST_TARGET_IP" --sport "$pt" \
         -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     fi
   done < "$STATE_FILE"
@@ -477,26 +581,19 @@ configure() {
   read -rp "Destination interface [$DEST_IF]: " input
   DEST_IF="${input:-$DEST_IF}"
 
-  read -rp "Destination IP (ex: 100.64.0.2) [$DEST_IP]: " input
-  DEST_IP="${input:-$DEST_IP}"
-
-  read -rp "Destination CIDR bits (ex: 24) [$DEST_CIDR_BITS]: " input
-  DEST_CIDR_BITS="${input:-$DEST_CIDR_BITS}"
-
-  if ! is_valid_ipv4 "$DEST_IP"; then
-    echo "✖ Invalid IP format: $DEST_IP"
+  if [[ -n "$DEST_IP" ]] && ! is_valid_ipv4 "$DEST_IP"; then
+    echo "✖ Invalid legacy destination IP: $DEST_IP"
     exit 1
   fi
 
-  if ! is_valid_cidr_bits "$DEST_CIDR_BITS"; then
-    echo "✖ Invalid CIDR bits: $DEST_CIDR_BITS (must be 0-32)"
+  if [[ -n "$DEST_CIDR_BITS" ]] && ! is_valid_cidr_bits "$DEST_CIDR_BITS"; then
+    echo "✖ Invalid legacy CIDR bits: $DEST_CIDR_BITS (must be 0-32)"
     exit 1
   fi
 
   echo
   echo "  Public interface  : $PUBLIC_IF"
   echo "  Destination iface : $DEST_IF"
-  echo "  Destination IP    : $DEST_IP"
   echo
 
   read -rp "Confirm and apply? [Y/n]: " confirm
@@ -539,6 +636,7 @@ EOF
   echo "✔ Configuration saved"
   echo "✔ sysctl persisted to $SYSCTL_FILE"
   echo "↪ Reloading rules..."
+  migrate_legacy_rules || true
   apply_rules
   echo "✔ Done"
 }
@@ -547,12 +645,14 @@ status() {
   load_config || true
 
   # Config summary
-  if [[ -z "$PUBLIC_IF" || -z "$DEST_IF" || -z "$DEST_IP" ]]; then
+  if [[ -z "$PUBLIC_IF" || -z "$DEST_IF" ]]; then
     echo "Configuration  : ✖ not configured (run: mfw configure)"
   else
     echo "Input iface      : $PUBLIC_IF"
     echo "Output iface     : $DEST_IF"
-    echo "Destination IP   : $DEST_IP"
+    if [[ -n "$DEST_IP" ]]; then
+      echo "Legacy target    : $DEST_IP/$DEST_CIDR_BITS"
+    fi
 
     # Count active iptables rules in our chains
     nat_count=$(iptables -t nat -L MFW_PREROUTING 2>/dev/null | grep -c DNAT || true)
@@ -566,11 +666,11 @@ status() {
   if [[ ! -s "$STATE_FILE" ]]; then
     echo "(no forwarding rules configured)"
   else
-    echo "PROTO  PORT"
+    echo "PROTO  PORT    DESTINATION"
     echo "---------------"
-    while read -r p pt; do
+    while read -r p pt rule_target; do
       [[ -z "$p" || "$p" =~ ^# ]] && continue
-      printf "  %-6s %s\n" "$p" "$pt"
+      printf "  %-6s %-6s %s\n" "$p" "$pt" "${rule_target:-$DEST_IP/$DEST_CIDR_BITS}"
     done < "$STATE_FILE"
   fi
 }
@@ -595,6 +695,7 @@ case "$cmd" in
     require_root
     bootstrap
     load_config || true
+    migrate_legacy_rules || true
     require_config
 
     if ! is_valid_proto "$proto"; then
@@ -605,19 +706,39 @@ case "$cmd" in
       echo "✖ Invalid port or range: '$port'"
       exit 1
     fi
-    (
-    flock -n 9 || { echo "✖ Could not lock $STATE_FILE"; exit 1; }
 
-    if grep -q "^$proto $port$" "$STATE_FILE"; then
-      echo "⚠️  $port/$proto already exists"
-      exit 0
+    resolved_dest=""
+    if [[ -n "$dest" ]]; then
+      resolved_dest="$(normalize_destination_spec "$dest")" || {
+        echo "✖ Invalid destination target: '$dest'"
+        exit 1
+      }
+    elif [[ -n "$DEST_IP" ]]; then
+      resolved_dest="$(normalize_destination_spec "$DEST_IP/$DEST_CIDR_BITS")"
     fi
 
-    echo "$proto $port" >> "$STATE_FILE"
-  ) 9>"$STATE_FILE.lock"
+    if [[ -z "$resolved_dest" ]]; then
+      echo "✖ Destination is required for new rules. Use: mfw add $proto $port <ip/cidr>"
+      exit 1
+    fi
+
+    (
+      flock -n 9 || { echo "✖ Could not lock $STATE_FILE"; exit 1; }
+
+      if grep -q "^$proto $port $resolved_dest$" "$STATE_FILE"; then
+        echo "⚠️  $port/$proto for $resolved_dest already exists"
+        exit 0
+      fi
+
+      if grep -q "^$proto $port$" "$STATE_FILE"; then
+        sed -i "s|^$proto $port$|$proto $port $resolved_dest|" "$STATE_FILE"
+      else
+        echo "$proto $port $resolved_dest" >> "$STATE_FILE"
+      fi
+    ) 9>"$STATE_FILE.lock"
 
     apply_rules
-    echo "✔ Added: $port/$proto"
+    echo "✔ Added: $port/$proto -> $resolved_dest"
     ;;
 
   del)
@@ -626,6 +747,7 @@ case "$cmd" in
     require_root
     bootstrap
     load_config || true
+    migrate_legacy_rules || true
     require_config
 
     if ! is_valid_proto "$proto"; then
@@ -639,12 +761,23 @@ case "$cmd" in
     (
       flock -n 9 || { echo "✖ Could not lock $STATE_FILE"; exit 1; }
 
-      if ! grep -q "^$proto $port$" "$STATE_FILE"; then
-        echo "⚠️  $port/$proto does not exist."
-        exit 1
+      if [[ -n "$dest" ]]; then
+        resolved_dest="$(normalize_destination_spec "$dest")" || {
+          echo "✖ Invalid destination target: '$dest'"
+          exit 1
+        }
+        if ! grep -q "^$proto $port $resolved_dest$" "$STATE_FILE"; then
+          echo "⚠️  $port/$proto for $resolved_dest does not exist."
+          exit 1
+        fi
+        sed -i "/^$proto $port $resolved_dest$/d" "$STATE_FILE"
+      else
+        if ! grep -q "^$proto $port" "$STATE_FILE"; then
+          echo "⚠️  $port/$proto does not exist."
+          exit 1
+        fi
+        sed -i "/^$proto $port\([[:space:]]\|$\)/d" "$STATE_FILE"
       fi
-
-      sed -i "/^$proto $port$/d" "$STATE_FILE"
     ) 9>"$STATE_FILE.lock"
 
     apply_rules
@@ -659,6 +792,7 @@ case "$cmd" in
     require_root
     bootstrap
     load_config || true
+    migrate_legacy_rules || true
     require_config
     apply_rules
     echo "✔ Reloaded all rules"
